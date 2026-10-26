@@ -9,7 +9,7 @@ const { queueEmail, tpl } = require('./mailer');
 const UPLOAD_DIR = process.env.UPLOAD_DIR || path.join(__dirname, '..', 'data', 'uploads');
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
-const DEFAULT_HF_SPACE = 'r3gm/wan2-2-fp8da-aoti-preview';
+const DEFAULT_HF_SPACE = 'multimodalart/wan2-1-fast'; // r3gm aoti Spaces reject API sessions ('session_not_found') — verified 2026-10-26; wan2-1-fast queue flow verified end-to-end
 const DEFAULT_IMAGE_SPACE = 'black-forest-labs/FLUX.1-schnell';
 const WAKE_WINDOW_MS = 10 * 60 * 1000; // ~10 minutes of wake retries
 const CHUNK_CAP_SECONDS = 10; // hard cap for one generated chunk
@@ -289,68 +289,101 @@ async function gradioUpload(host, token, filePath, mime) {
   return { path: p, orig_name: path.basename(filePath), meta: { _type: 'gradio.FileData' } };
 }
 
-function parseSseOutputs(text) {
-  let eventName = '';
-  for (const rawLine of String(text).split('\n')) {
-    const line = rawLine.trim();
-    if (line.startsWith('event:')) { eventName = line.slice(6).trim(); continue; }
-    if (!line.startsWith('data:')) continue;
-    const payload = line.slice(5).trim();
-    if (!payload) continue;
-    let parsed; try { parsed = JSON.parse(payload); } catch (e) { continue; }
-    if (eventName === 'error') {
-      const msg = parsed && (parsed.error || parsed.message) ? String(parsed.error || parsed.message) : 'the Space sent an error event';
-      return { state: 'error', message: msg };
+// Gradio queue protocol (verified live 2026-10-26): the /gradio_api/call/{fn}
+// sugar endpoint returns "404: Session not found" error events on current
+// ZeroGPU Spaces — the working flow is POST /gradio_api/queue/join with
+// fn_index + session_hash, then stream GET /gradio_api/queue/data?session_hash=…
+// and follow the msg events for our event_id. process_completed carries the
+// real failure text in output.error (e.g. the ZeroGPU quota message).
+function parseQueueMessage(parsed, eventId) {
+  if (!parsed || typeof parsed !== 'object') return { state: 'pending' };
+  if (parsed.event_id && parsed.event_id !== eventId) return { state: 'pending' };
+  switch (parsed.msg) {
+    case 'process_completed': {
+      const out = parsed.output || {};
+      if (out.error) return { state: 'error', message: String(out.error) };
+      if (Array.isArray(out.data)) return { state: 'complete', outputs: out.data };
+      if (parsed.success === false) return { state: 'error', message: 'the Space reported a failed run' };
+      return { state: 'complete', outputs: [] };
     }
-    if (Array.isArray(parsed)) return { state: 'complete', outputs: parsed };
-    if (parsed && parsed.msg === 'process_completed' && parsed.output && Array.isArray(parsed.output.data)) {
-      return { state: 'complete', outputs: parsed.output.data };
-    }
-    if (parsed && (parsed.msg === 'process_failed' || parsed.msg === 'queue_full')) {
-      return { state: 'error', message: (parsed.error && parsed.error.message) || parsed.msg };
-    }
-    if (parsed && typeof parsed.error === 'string' && parsed.error) return { state: 'error', message: parsed.error };
+    case 'process_failed':
+    case 'queue_full':
+      return { state: 'error', message: (parsed.error && parsed.error.message) || String(parsed.msg) };
+    default:
+      if (typeof parsed.error === 'string' && parsed.error) return { state: 'error', message: parsed.error };
+      return { state: 'pending' };
   }
-  return { state: 'pending' };
 }
 
-async function pollGradioEvent(host, token, apiName, eventId, timeoutMs) {
+function outcomeToError(outcome) {
+  const reason = outcome.message || 'unknown error';
+  if (/quota/i.test(reason)) return new EngineError(`The free engine reported a quota problem: ${reason}`, false);
+  return new EngineError(`The Space reported an error: ${reason}`, /waking|starting|loading|queue is full/i.test(reason));
+}
+
+async function pollQueueData(host, token, sessionHash, eventId, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     let r;
     try {
-      r = await fetchWithTimeout(`${host}/gradio_api/call/${apiName}/${eventId}`, {
+      r = await fetchWithTimeout(`${host}/gradio_api/queue/data?session_hash=${encodeURIComponent(sessionHash)}`, {
         headers: { Authorization: `Bearer ${token}` },
       }, timeoutMs + 60000);
     } catch (e) { throw new EngineError(`Connection dropped while waiting for the Space to finish (${e.message}) — it may be waking up.`, true); }
     if (!r.ok) throw classifyHttp(r.status, 'waiting for the Space to finish');
-    const outcome = parseSseOutputs(await r.text());
-    if (outcome.state === 'complete') return outcome.outputs;
-    if (outcome.state === 'error') {
-      const reason = outcome.message || 'unknown error';
-      if (/quota/i.test(reason)) throw new EngineError(`The free engine reported a quota problem: ${reason}`, false);
-      throw new EngineError(`The Space reported an error: ${reason}`, /waking|starting|loading|queue is full/i.test(reason));
+    if (!r.body || typeof r.body.getReader !== 'function') throw new EngineError('The Space queue stream was not readable.', true);
+    const reader = r.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = '';
+    let terminal = null;
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        let nl;
+        while ((nl = buf.indexOf('\n')) >= 0) {
+          const line = buf.slice(0, nl).trim();
+          buf = buf.slice(nl + 1);
+          if (!line.startsWith('data:')) continue;
+          let parsed; try { parsed = JSON.parse(line.slice(5).trim()); } catch (e) { continue; }
+          const outcome = parseQueueMessage(parsed, eventId);
+          if (outcome.state !== 'pending') { terminal = outcome; break; }
+        }
+        if (terminal) break;
+        if (Date.now() > deadline) break;
+      }
+    } catch (e) {
+      // Socket dropped mid-stream (the old "terminated") — fall through and
+      // re-attach; the queue replays this session's events.
+      terminal = null;
+    } finally {
+      try { await reader.cancel(); } catch (e) { /* already closed */ }
     }
+    if (terminal && terminal.state === 'complete') return terminal.outputs;
+    if (terminal && terminal.state === 'error') throw outcomeToError(terminal);
     // Stream closed without a terminal event — re-attach after a short pause.
     await new Promise((res) => setTimeout(res, 2000));
   }
   throw new EngineError('Timed out waiting for the Space to finish.', true);
 }
 
-async function gradioCall(host, token, apiName, data, timeoutMs = 15 * 60 * 1000) {
+async function gradioCall(host, token, dep, data, timeoutMs = 15 * 60 * 1000) {
+  if (!dep || typeof dep.id !== 'number') throw new EngineError('The Space config did not expose a callable generation endpoint.', false);
+  const sessionHash = crypto.randomBytes(8).toString('hex');
   let r;
   try {
-    r = await fetchWithTimeout(`${host}/gradio_api/call/${apiName}`, {
+    r = await fetchWithTimeout(`${host}/gradio_api/queue/join`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-      body: JSON.stringify({ data, session_hash: crypto.randomBytes(8).toString('hex') }),
+      body: JSON.stringify({ data, fn_index: dep.id, session_hash: sessionHash }),
     }, 120000);
   } catch (e) { throw new EngineError(`The Space closed the connection while submitting (${e.message}). Free ZeroGPU Spaces do this while they are waking up.`, true); }
   if (!r.ok) throw classifyHttp(r.status, 'submitting to the queue');
   const joined = await r.json().catch(() => null);
   const eventId = joined && joined.event_id;
   if (!eventId) throw new EngineError('The Space queue returned no event id.', true);
-  return pollGradioEvent(host, token, apiName, eventId, timeoutMs);
+  return pollQueueData(host, token, sessionHash, eventId, timeoutMs);
 }
 
 function firstFileData(outputs) {
@@ -420,7 +453,7 @@ async function generateStartImage(cfg, job, jobDir) {
   const dep = findGenerateDep(config);
   if (!dep) throw new EngineError(`The image Space "${space}" exposes no usable generate endpoint.`, false);
   const data = buildDataFromConfig(config, dep, imageFill({ promptText: job.prompt, width: 1024, height: 576 }));
-  const outputs = await gradioCall(host, cfg.hf.token, dep.api_name, data);
+  const outputs = await gradioCall(host, cfg.hf.token, dep, data);
   const file = firstFileData(outputs);
   if (!file) throw new EngineError('The image Space finished but returned no image.', false);
   await downloadSpaceFile(host, cfg.hf.token, file, dest, 'the generated start image');
@@ -458,7 +491,7 @@ async function runVideoChunk(cfg, vctx, job, chunkSeconds, startImagePath) {
   const data = buildDataFromConfig(config, dep, videoFill({
     promptText: job.prompt + voiceNote, seconds: chunkSeconds, startFileData,
   }));
-  const outputs = await gradioCall(host, cfg.hf.token, dep.api_name, data);
+  const outputs = await gradioCall(host, cfg.hf.token, dep, data);
   const file = firstFileData(outputs);
   if (!file) throw new EngineError('The Space finished but returned no video file.', false);
   return { host, file };
@@ -608,6 +641,6 @@ module.exports = {
   setSetting, deleteSetting,
   _internals: {
     resolveSpaceHost, fetchSpaceConfig, findGenerateDep, buildDataFromConfig,
-    videoFill, imageFill, chunkCapSeconds, depHasImageInput, parseSseOutputs,
+    videoFill, imageFill, chunkCapSeconds, depHasImageInput, parseQueueMessage,
   },
 };
