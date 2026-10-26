@@ -1,0 +1,33 @@
+# VYRX Studio — Render blueprint (free web service)
+# NOTE (free tier): Render free web services spin down after ~15 min idle and
+# have an EPHEMERAL filesystem — the SQLite DB and uploads reset on redeploy/
+# restart. For durable data later, upgrade to a paid instance with a
+# persistent disk mounted at /var/data and set DATABASE_PATH + UPLOAD_DIR to it.
+services:
+  - type: web
+    name: vyrx-studio
+    env: node
+    plan: free
+    buildCommand: npm install && npm run build
+    startCommand: npm start
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
+      - key: NODE_ENV
+        value: production
+      - key: DATABASE_PATH
+        value: /tmp/vyrx.db
+      - key: UPLOAD_DIR
+        value: /tmp/uploads
+      - key: SESSION_SECRET
+        generateValue: true
+      - key: SMTP_HOST
+        sync: false
+      - key: SMTP_PORT
+        value: "587"
+      - key: SMTP_USER
+        sync: false
+      - key: SMTP_PASS
+        sync: false
+      - key: SMTP_FROM
+        sync: false
